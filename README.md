@@ -1,6 +1,6 @@
 # Proyecto-RecSys
 
-## Integrantes: Pablo Lagos y Benjamín Suazo
+#### Integrantes: Pablo Lagos y Benjamín Suazo
 
 ## Tema: Multimodalidad: Recomendación de Videojuegos
 

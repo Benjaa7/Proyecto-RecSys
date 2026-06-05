@@ -1,0 +1,18 @@
+# Notebooks de resultados intermedios / versiones descartadas
+H2/Hybrid_BPR_results.ipynb
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Datos locales grandes (no versionar)
+*.csv
+*.json
+*.pth
+ndcg_*.png

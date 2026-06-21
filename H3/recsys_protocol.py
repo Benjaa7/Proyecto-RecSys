@@ -222,6 +222,12 @@ def build_splits(df: pd.DataFrame, cfg: ProtocolConfig = ProtocolConfig(),
         recs_train = df[df[uc].isin(tp)].copy()
         train_pool = np.sort(np.fromiter(tp, dtype=eval_pool.dtype))
 
+    # El tiempo puede venir como string (algunos notebooks difieren el parseo por
+    # velocidad): parsear SOLO el subconjunto de train_pool y luego ordenar. Las
+    # fechas ISO (YYYY-MM-DD) ordenan bien como string, pero parseamos por robustez.
+    if not pd.api.types.is_datetime64_any_dtype(recs_train[tc]):
+        recs_train = recs_train.copy()
+        recs_train[tc] = pd.to_datetime(recs_train[tc], errors="coerce")
     recs_train = recs_train.sort_values([uc, tc])
     is_eval = recs_train[uc].isin(eval_set)
     last_idx = recs_train[is_eval].groupby(uc).tail(1).index
@@ -320,21 +326,42 @@ def coverage_at_k(recs: dict, catalog_size: int, k: int = 10) -> float:
 
 
 def novelty_at_k(recs: dict, popularity: dict, total: int, k: int = 10,
-                 eps: float = 1e-10) -> float:
-    """Novedad = self-information media -log2(p(i)), p(i)=popularity[i]/total.
+                 skip_unseen: bool = True) -> float:
+    """Novedad = self-information media -log2(p(i)), con p(i)=popularity[i]/total.
 
-    NOTA de estandarización: H2 tenía dos variantes (CPGRec usaba
-    total=Σinteracciones y omitía p==0; BPR usaba total=nº usuarios train y
-    sumaba eps). Aquí se canoniza a popularity/`total` con `total` explícito
-    (pasar `sum(popularity.values())` para réplica exacta de CPGRec, o el nº de
-    usuarios de train para la de BPR). Documentar cuál se usa en el paper."""
+    CONVENCIÓN DEL PROYECTO (estandarizada): `total = sum(popularity.values())`
+    (nº total de interacciones positivas en train) y `skip_unseen=True` (ignora
+    ítems con popularidad 0, es decir nunca vistos como positivos en train). Es
+    la convención de H2 SBERT/CPGRec; H2 BPR usaba `total=nº usuarios` y default
+    1 → distinta ESCALA. El denominador es un corrimiento constante en log, así
+    que lo único imprescindible es usar la MISMA convención en todos los modelos
+    de una misma tabla. `skip_unseen=False` cuenta los no vistos como si
+    aparecieran 1 vez (replica el comportamiento viejo de BPR)."""
     scores = []
     for items in recs.values():
-        nov = [-np.log2(popularity.get(i, 0) / total + eps) for i in items[:k]
-               if popularity.get(i, 0) > 0 or eps > 0]
+        nov = []
+        for i in items[:k]:
+            p = popularity.get(i, 0)
+            if p > 0:
+                nov.append(-np.log2(p / total))
+            elif not skip_unseen:
+                nov.append(-np.log2(1.0 / total))
         if nov:
             scores.append(float(np.mean(nov)))
     return float(np.mean(scores)) if scores else 0.0
+
+
+def diversity_metrics(recs: dict, *, popularity: dict, total: int,
+                      item_to_idx: dict, factors, n_catalog: int,
+                      k: int = 10, assume_normalized: bool = False) -> dict:
+    """Bundle Coverage/ILD/Novelty@k (espejo del `diversity_metrics` de H2 SBERT).
+    Conveniencia para no repetir las tres llamadas en cada notebook; usa la
+    convención canónica de Novelty (ver `novelty_at_k`)."""
+    return {
+        f"Coverage@{k}": coverage_at_k(recs, n_catalog, k),
+        f"ILD@{k}": ild_at_k(recs, item_to_idx, factors, k, assume_normalized),
+        f"Novelty@{k}": novelty_at_k(recs, popularity, total, k),
+    }
 
 
 def ild_at_k(recs: dict, item_to_idx: dict, factors, k: int = 10,

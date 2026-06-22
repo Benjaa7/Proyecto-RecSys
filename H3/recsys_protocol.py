@@ -228,7 +228,12 @@ def build_splits(df: pd.DataFrame, cfg: ProtocolConfig = ProtocolConfig(),
     if not pd.api.types.is_datetime64_any_dtype(recs_train[tc]):
         recs_train = recs_train.copy()
         recs_train[tc] = pd.to_datetime(recs_train[tc], errors="coerce")
-    recs_train = recs_train.sort_values([uc, tc])
+    # DESEMPATE DETERMINISTA: las fechas suelen ser a nivel de día → muchos usuarios
+    # tienen varias interacciones en su último día. Ordenar también por `ic` (ítem)
+    # hace que el ítem retenido (tail(1)) sea el MISMO sin importar el orden de filas
+    # de entrada → split idéntico entre notebooks (BPR/SBERT/CPGRec). Sin esto, el
+    # empate se rompía según el orden de carga/dedup y cada notebook evaluaba otro set.
+    recs_train = recs_train.sort_values([uc, tc, ic])
     is_eval = recs_train[uc].isin(eval_set)
     last_idx = recs_train[is_eval].groupby(uc).tail(1).index
 

@@ -58,6 +58,11 @@ import pandas as pd
 # ─────────────────────────────────────────────────────────────────────────────
 SEED = 42  # ÚNICA seed del proyecto. No redefinir por notebook.
 
+# Versión del protocolo. Se imprime en set_global_seed para verificar de un
+# vistazo QUÉ versión del módulo cargó cada corrida (clave en Colab, donde el
+# módulo se trae por git clone/pull). Subir al cambiar la lógica del split/métricas.
+PROTOCOL_VERSION = "2026-06-22c (split: desempate determinista [user,date,item])"
+
 
 def set_global_seed(seed: int = SEED, deterministic_torch: bool = True,
                     verbose: bool = True) -> None:
@@ -86,6 +91,7 @@ def set_global_seed(seed: int = SEED, deterministic_torch: bool = True,
     except ImportError:
         backend += " (torch no instalado)"
     if verbose:
+        print(f"[protocol] v{PROTOCOL_VERSION}")
         print(f"[protocol] seed global = {seed} | {backend}")
 
 

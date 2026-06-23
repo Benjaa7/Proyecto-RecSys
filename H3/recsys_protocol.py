@@ -61,7 +61,7 @@ SEED = 42  # ÚNICA seed del proyecto. No redefinir por notebook.
 # Versión del protocolo. Se imprime en set_global_seed para verificar de un
 # vistazo QUÉ versión del módulo cargó cada corrida (clave en Colab, donde el
 # módulo se trae por git clone/pull). Subir al cambiar la lógica del split/métricas.
-PROTOCOL_VERSION = "2026-06-22c (split: desempate determinista [user,date,item])"
+PROTOCOL_VERSION = "2026-06-23a (desempate neutral por hash + most_popular_list + multiseed)"
 
 
 def set_global_seed(seed: int = SEED, deterministic_torch: bool = True,
@@ -179,6 +179,22 @@ def iterative_k_core(df: pd.DataFrame, min_user: int, min_game: int,
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Split leave-one-out temporal + política eval/train pool
 # ─────────────────────────────────────────────────────────────────────────────
+def _tiebreak_key(users, items, seed: int) -> np.ndarray:
+    """Clave de desempate pseudoaleatoria, DETERMINISTA y neutral (uint64).
+    Mezcla (user, item, seed) con un finalizador estilo MurmurHash3 → orden bien
+    distribuido e independiente de la magnitud del id (no sesga por recencia).
+    Determinista entre notebooks/máquinas para una misma seed."""
+    M = np.uint64(0xFFFFFFFFFFFFFFFF)
+    u = (np.asarray(users).astype(np.uint64)) & M
+    i = (np.asarray(items).astype(np.uint64)) & M
+    s = np.uint64((int(seed) * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF)
+    x = (u * np.uint64(0x9E3779B97F4A7C15)) ^ (i * np.uint64(0xC2B2AE3D27D4EB4F)) ^ s
+    x ^= (x >> np.uint64(33)); x = x * np.uint64(0xFF51AFD7ED558CCD)
+    x ^= (x >> np.uint64(33)); x = x * np.uint64(0xC4CEB9FE1A85EC53)
+    x ^= (x >> np.uint64(33))
+    return x
+
+
 @dataclass
 class Splits:
     """Salida de `build_splits`. Todo lo que un notebook necesita aguas abajo."""
@@ -221,7 +237,7 @@ def build_splits(df: pd.DataFrame, cfg: ProtocolConfig = ProtocolConfig(),
     eval_set = set(eval_pool.tolist())
 
     if cfg.frac_train >= 1.0:
-        recs_train = df
+        recs_train = df.copy()           # copia: evita mutar el df del caller
         train_pool = None
     else:
         tp = set(sample_users(df, cfg.frac_train, cfg.seed, user_col=uc).tolist()) | eval_set
@@ -229,22 +245,23 @@ def build_splits(df: pd.DataFrame, cfg: ProtocolConfig = ProtocolConfig(),
         train_pool = np.sort(np.fromiter(tp, dtype=eval_pool.dtype))
 
     # El tiempo puede venir como string (algunos notebooks difieren el parseo por
-    # velocidad): parsear SOLO el subconjunto de train_pool y luego ordenar. Las
-    # fechas ISO (YYYY-MM-DD) ordenan bien como string, pero parseamos por robustez.
+    # velocidad): parsear SOLO el subconjunto de train_pool y luego ordenar.
     if not pd.api.types.is_datetime64_any_dtype(recs_train[tc]):
-        recs_train = recs_train.copy()
         recs_train[tc] = pd.to_datetime(recs_train[tc], errors="coerce")
-    # DESEMPATE DETERMINISTA: las fechas suelen ser a nivel de día → muchos usuarios
-    # tienen varias interacciones en su último día. Ordenar también por `ic` (ítem)
-    # hace que el ítem retenido (tail(1)) sea el MISMO sin importar el orden de filas
-    # de entrada → split idéntico entre notebooks (BPR/SBERT/CPGRec). Sin esto, el
-    # empate se rompía según el orden de carga/dedup y cada notebook evaluaba otro set.
-    recs_train = recs_train.sort_values([uc, tc, ic])
+    # DESEMPATE NEUTRAL Y DETERMINISTA: las fechas son a nivel de día → muchos
+    # usuarios tienen varias interacciones en su último día. Rompemos el empate con
+    # una clave hash de (user, item, seed): es DETERMINISTA (mismo split entre
+    # notebooks dada la misma seed) y NEUTRAL respecto a la magnitud del app_id
+    # (no sesga hacia juegos nuevos, como sí lo hacía ordenar por `ic`). Al variar
+    # la seed (multi-seed) cambia también el desempate → la varianza lo captura.
+    recs_train["_tb"] = _tiebreak_key(recs_train[uc].to_numpy(),
+                                      recs_train[ic].to_numpy(), cfg.seed)
+    recs_train = recs_train.sort_values([uc, tc, "_tb"])
     is_eval = recs_train[uc].isin(eval_set)
     last_idx = recs_train[is_eval].groupby(uc).tail(1).index
 
-    train_df = recs_train.drop(index=last_idx).reset_index(drop=True)
-    test_df = recs_train.loc[last_idx].reset_index(drop=True)
+    train_df = recs_train.drop(index=last_idx).drop(columns="_tb").reset_index(drop=True)
+    test_df = recs_train.loc[last_idx].drop(columns="_tb").reset_index(drop=True)
     test_pos = test_df if pc is None else test_df[test_df[pc]].copy()
 
     train_items_per_user = train_df.groupby(uc)[ic].apply(set).to_dict()
@@ -285,6 +302,16 @@ def positives(df: pd.DataFrame, cfg: ProtocolConfig) -> pd.DataFrame:
 def popularity_counts(train_df: pd.DataFrame, cfg: ProtocolConfig) -> dict:
     """Conteo de interacciones positivas por ítem en train (para Novelty/fallback)."""
     return positives(train_df, cfg).groupby(cfg.item_col).size().to_dict()
+
+
+def most_popular_list(train_df: pd.DataFrame, cfg: ProtocolConfig) -> list:
+    """Ranking de ítems por popularidad (interacciones positivas en train) con
+    DESEMPATE DETERMINISTA (popularidad desc, luego item_col asc). Usar en TODOS
+    los notebooks para el baseline Most Popular y el fallback cold-start, de modo
+    que el orden sea idéntico (antes BPR usaba sorted estable y SBERT
+    `sort_values` inestable → diferían en @5)."""
+    pop = popularity_counts(train_df, cfg)
+    return [it for it, _ in sorted(pop.items(), key=lambda kv: (-kv[1], kv[0]))]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -441,7 +468,52 @@ def activity_ndcg(recs: dict, test_item: dict, train_items: dict, k: int = 10,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Nota de reproducibilidad (para el paper)
+# 5. Multi-seed (media ± desviación sobre varias seeds)
+# ─────────────────────────────────────────────────────────────────────────────
+def run_multiseed(run_one, seeds=(42, 43, 44), verbose: bool = True):
+    """Corre `run_one(seed)` por cada seed y agrega media ± desviación.
+
+    `run_one(seed)` debe ejecutar el split + entrenamiento + evaluación con esa
+    seed y devolver `dict {modelo: {metrica: valor_float}}`. Lo costoso e
+    independiente de la seed (cargar datos, k-core, embeddings) debe quedar FUERA
+    de `run_one` (calcularlo una vez y cerrarlo por closure).
+
+    Devuelve `(agg, raw)`:
+      - `agg[modelo][metrica] = (media, desv)`  (desv muestral; 0 si una sola seed)
+      - `raw = [dict_por_seed, ...]`
+    """
+    raw = []
+    for s in seeds:
+        if verbose:
+            print(f"[multiseed] seed={s} ...")
+        raw.append(run_one(s))
+    models = list(raw[0].keys())
+    agg = {}
+    for mdl in models:
+        agg[mdl] = {}
+        for met in raw[0][mdl]:
+            vals = [r[mdl][met] for r in raw if mdl in r and met in r[mdl]
+                    and isinstance(r[mdl][met], (int, float))]
+            if not vals:
+                continue
+            n = len(vals)
+            mean = sum(vals) / n
+            std = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** 0.5 if n > 1 else 0.0
+            agg[mdl][met] = (mean, std)
+    return agg, raw
+
+
+def format_multiseed(agg: dict, metrics: Sequence[str], dec: int = 4) -> "pd.DataFrame":
+    """DataFrame legible con celdas 'media ± desv' para las métricas pedidas."""
+    rows = {}
+    for mdl, md in agg.items():
+        rows[mdl] = {m: (f"{md[m][0]:.{dec}f} ± {md[m][1]:.{dec}f}" if m in md else "")
+                     for m in metrics}
+    return pd.DataFrame(rows).T[list(metrics)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Nota de reproducibilidad (para el paper)
 # ─────────────────────────────────────────────────────────────────────────────
 def reproducibility_note(cfg: ProtocolConfig, dataset_name: str = "") -> str:
     """Texto listo para la sección de reproducibilidad del paper/README."""
@@ -463,7 +535,7 @@ def reproducibility_note(cfg: ProtocolConfig, dataset_name: str = "") -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Auto-test (no requiere los datasets reales)
+# 7. Auto-test (no requiere los datasets reales)
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
@@ -499,4 +571,35 @@ if __name__ == "__main__":
     assert abs(m["Recall@3"] - 0.5) < 1e-9, m
     assert abs(m["Recall@1"] - 0.0) < 1e-9, m
     print(f"métricas sanity: NDCG@3={m['NDCG@3']:.4f} Recall@3={m['Recall@3']:.2f} ✓")
+
+    # Split: desempate NEUTRAL y determinista bajo reordenamiento (fechas con empates).
+    rng2 = np.random.default_rng(1)
+    rows = []
+    for u in range(200):
+        n = rng2.integers(5, 12)
+        items = rng2.choice(120, n, replace=False)
+        days = sorted(rng2.integers(0, 30, n))            # empates de día frecuentes
+        for it, d in zip(items, days):
+            rows.append((u, int(it), "2020-01-%02d" % (d + 1), bool(rng2.random() < 0.8)))
+    dft = pd.DataFrame(rows, columns=["user_id", "app_id", "date", "is_recommended"])
+    cfg_t = ProtocolConfig(frac_eval=1.0, frac_train=1.0, min_user=5, min_game=2,
+                           max_eval_users=None)
+    s1 = build_splits(dft.copy(), cfg_t, verbose=False).test_item_per_user
+    s2 = build_splits(dft.sample(frac=1.0, random_state=7).reset_index(drop=True),
+                      cfg_t, verbose=False).test_item_per_user
+    assert s1 == s2, "split NO determinista bajo reordenamiento"
+    print(f"split determinista bajo reordenamiento: {s1 == s2} ✓ (n={len(s1)})")
+
+    # most_popular_list determinista
+    mp = most_popular_list(dft, cfg_t)
+    assert mp == most_popular_list(dft.sample(frac=1.0, random_state=3).reset_index(drop=True), cfg_t)
+    print(f"most_popular_list determinista: True ✓ (top3={mp[:3]})")
+
+    # run_multiseed: agrega media±desv
+    def _run_one(seed):
+        return {"M": {"x": float(seed), "y": 1.0}}
+    agg, raw = run_multiseed(_run_one, seeds=(1, 2, 3), verbose=False)
+    assert abs(agg["M"]["x"][0] - 2.0) < 1e-9 and agg["M"]["y"][1] == 0.0
+    print(f"run_multiseed: x media±desv = {agg['M']['x'][0]:.2f}±{agg['M']['x'][1]:.2f} ✓")
+
     print("\nTodos los auto-tests OK.")

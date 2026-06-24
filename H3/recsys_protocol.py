@@ -38,7 +38,7 @@ Uso típico en un notebook (tras clonar el repo y tenerlo en sys.path):
 
     set_global_seed()                       # una vez, al inicio
     recs = iterative_k_core(recs, 5, 20)    # mismo k-core en todos
-    cfg  = ProtocolConfig(frac_eval=0.10, frac_train=0.10)
+    cfg  = ProtocolConfig(frac_eval=0.10, frac_train=0.30)
     sp   = build_splits(recs, cfg)          # eval pool determinista + LOO
     # sp.train_df / sp.test_item_per_user / sp.train_items_per_user / sp.eval_users
 """
@@ -61,7 +61,7 @@ SEED = 42  # ÚNICA seed del proyecto. No redefinir por notebook.
 # Versión del protocolo. Se imprime en set_global_seed para verificar de un
 # vistazo QUÉ versión del módulo cargó cada corrida (clave en Colab, donde el
 # módulo se trae por git clone/pull). Subir al cambiar la lógica del split/métricas.
-PROTOCOL_VERSION = "2026-06-23a (desempate neutral por hash + most_popular_list + multiseed)"
+PROTOCOL_VERSION = "2026-06-23b (defaults: eval sin tope max_eval_users=None + frac_train=0.30)"
 
 
 def set_global_seed(seed: int = SEED, deterministic_torch: bool = True,
@@ -105,8 +105,8 @@ class ProtocolConfig:
     seed: int = SEED
     # Muestreo de usuarios
     frac_eval: float = 0.10        # universo de EVALUACIÓN (fijo, define a quién se mide)
-    frac_train: float = 0.10       # universo de ENTRENAMIENTO (palanca; >= frac_eval; 1.0 = todos)
-    max_eval_users: int = 2000     # tope de usuarios evaluados (None = sin tope)
+    frac_train: float = 0.30       # universo de ENTRENAMIENTO (palanca; >= frac_eval; 1.0 = todos). 0.30 = precedente SCGRec (§3.2)
+    max_eval_users: Optional[int] = None  # tope de usuarios evaluados (None = sin tope; decisión §3.1: evaluar todos los elegibles)
     # k-core
     min_user: int = 5
     min_game: int = 20
@@ -518,6 +518,7 @@ def format_multiseed(agg: dict, metrics: Sequence[str], dec: int = 4) -> "pd.Dat
 def reproducibility_note(cfg: ProtocolConfig, dataset_name: str = "") -> str:
     """Texto listo para la sección de reproducibilidad del paper/README."""
     head = f"Protocolo {dataset_name}".strip()
+    tope = "sin tope (todos los elegibles)" if cfg.max_eval_users is None else f"≤{cfg.max_eval_users}"
     return (
         f"{head}\n"
         f"  seed global         : {cfg.seed} (numpy/random/torch/cuda, cudnn determinista)\n"
@@ -525,7 +526,7 @@ def reproducibility_note(cfg: ProtocolConfig, dataset_name: str = "") -> str:
         f"(⊇ eval) · determinista sobre np.sort(usuarios)\n"
         f"  k-core              : ≥{cfg.min_user} interac/usuario, ≥{cfg.min_game} interac/ítem (iterativo)\n"
         f"  split               : leave-one-out temporal (último ítem positivo a test)\n"
-        f"  evaluación          : full-ranking sobre el catálogo · ≤{cfg.max_eval_users} usuarios · "
+        f"  evaluación          : full-ranking sobre el catálogo · {tope} usuarios · "
         f"K∈{tuple(cfg.ks)}\n"
         f"  columnas            : user={cfg.user_col} item={cfg.item_col} "
         f"time={cfg.time_col} pos={cfg.pos_col}\n"
